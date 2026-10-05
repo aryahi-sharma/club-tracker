@@ -2598,7 +2598,23 @@ def send_practice_reminder(user, ps):
 
 
 def process_practice_session_reminders():
-    """Email members before a practice slot they have claimed."""
+    """Email members before a practice slot they have claimed.
+
+    Wrapped so a transient database outage — Railway's internal DNS fails
+    occasionally during a deploy or a Postgres restart — logs one line
+    instead of a full traceback every minute. The pool has pre-ping enabled,
+    so the next run reconnects on its own.
+    """
+    try:
+        _run_practice_session_reminders()
+    except Exception as exc:
+        # The app context inside tears the session down on its way out, so
+        # there is nothing to clean up here.
+        print(f'[Reminders] skipped this run: {type(exc).__name__}: '
+              f'{str(exc).splitlines()[0][:160]}')
+
+
+def _run_practice_session_reminders():
     with app.app_context():
         now = datetime.now(LOCAL_TZ)
         window_end = (now + timedelta(days=1)).date()
@@ -5455,8 +5471,22 @@ def checklist_completion():
 
 scheduler = BackgroundScheduler()
 
-if not scheduler.running:
-    scheduler.add_job(process_practice_session_reminders, 'interval', minutes=1)
+# Set RUN_SCHEDULER=0 to stop a worker running the reminder job. With more
+# than one gunicorn worker the job otherwise runs once per worker each
+# minute; duplicate emails are already prevented by the unique constraint on
+# ReminderLog, but the extra queries and log noise serve no purpose.
+_SCHEDULER_ENABLED = os.getenv('RUN_SCHEDULER', '1').strip().lower() not in {
+    '0', 'false', 'no', 'off'
+}
+
+if _SCHEDULER_ENABLED and not scheduler.running:
+    # coalesce: if runs pile up during an outage, do one catch-up, not a burst.
+    # misfire_grace_time: drop runs that are already stale rather than firing
+    # a backlog of reminders for slots that have since passed.
+    scheduler.add_job(
+        process_practice_session_reminders, 'interval', minutes=1,
+        coalesce=True, max_instances=1, misfire_grace_time=300,
+    )
     scheduler.start()
     print("REMINDER SCHEDULER STARTED")
 
