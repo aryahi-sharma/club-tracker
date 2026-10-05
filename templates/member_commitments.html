@@ -41,6 +41,74 @@
     </div>
 </div>
 
+{# ── Written progress ───────────────────────────────────────────── #}
+<div class="card border-0 shadow-sm rounded-4 mb-4">
+    <div class="card-body p-4">
+        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+            <div>
+                <h4 class="mb-0">Written Progress</h4>
+                <p class="text-muted small mb-0">
+                    {% if written_event %}
+                        Checklist for {{ written_event }}. Your mentor marks each
+                        section complete.
+                    {% else %}
+                        No event is assigned to you yet, so there is no written
+                        checklist to show. Ask your mentor if this looks wrong.
+                    {% endif %}
+                </p>
+            </div>
+            {% if written_total %}
+            <span class="badge rounded-pill px-3 py-2
+                {% if written_done == written_total %}bg-success{% else %}bg-primary{% endif %}">
+                {{ written_done }} / {{ written_total }} complete
+            </span>
+            {% endif %}
+        </div>
+
+        {% if written_items %}
+        {% set pct = (written_done / written_total * 100) | round(0, 'floor') | int %}
+        <div class="progress mb-3" style="height: 8px;" role="progressbar"
+             aria-valuenow="{{ pct }}" aria-valuemin="0" aria-valuemax="100">
+            <div class="progress-bar {% if written_done == written_total %}bg-success{% endif %}"
+                 style="width: {{ pct }}%;"></div>
+        </div>
+
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th>Section</th>
+                        <th>Deadline</th>
+                        <th class="text-end">Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in written_items %}
+                    <tr>
+                        <td>{{ item.name }}</td>
+                        <td class="text-muted small">{{ item.deadline_text or '—' }}</td>
+                        <td class="text-end">
+                            {% if item.completed %}
+                            <span class="badge bg-success">Complete</span>
+                            {% elif item.overdue %}
+                            <span class="badge bg-danger">Overdue</span>
+                            {% else %}
+                            <span class="badge bg-secondary">Not yet</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% elif written_event %}
+        <p class="text-muted mb-0">
+            No written checklist is defined for {{ written_event }}.
+        </p>
+        {% endif %}
+    </div>
+</div>
+
 {# ── Active conference commitment progress only ────────────────── #}
 {% set conf = active_conf %}
 {% set com = all_commitments_map.get(conf) %}

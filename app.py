@@ -3009,9 +3009,16 @@ def build_mentee_risk_report(members, event_items, event_deadlines, today=None):
             member, today=today, commitments=member_commitments
         )
         item_names = event_items.get(event, [])
+        # Items are stored against the prefixed event ("2026-27:BOR"); the raw
+        # key is kept as a fallback for rows written before the prefix existed.
         completed = {
             item.item_name: bool(item.completed)
-            for item in checklist_by_member.get((member.id, event), [])
+            for item in (
+                checklist_by_member.get(
+                    (member.id, f'{CURRENT_WRITTEN_STORAGE_PREFIX}{event}'), [])
+                + checklist_by_member.get((member.id, event), [])
+            )
+            if item.item_name
         }
         written = _written_status(
             item_names,
@@ -3400,10 +3407,56 @@ def member_commitments():
     active_conf = get_active_conference()
     all_commitments = Commitment.query.filter_by(member_name=current_user.username).all()
     all_commitments_map = {com.event: com for com in all_commitments}
+
+    # Written checklist for this mentee's event. Every lookup below tolerates
+    # a missing pod, a pod with no event, or an event with no checklist, so a
+    # mentee who is not fully set up still sees the rest of the page.
+    today = datetime.now(LOCAL_TZ).date()
+    pod = MentorPod.query.filter_by(member_id=current_user.id).first()
+    event = (pod.event or '').strip() if pod and pod.event else ''
+
+    event_items, event_deadlines = get_written_checklist_catalog()
+    for event_code, family in WRITTEN_EVENT_FAMILY.items():
+        if event_code not in event_items and family in event_items:
+            event_items[event_code] = list(event_items[family])
+            event_deadlines[event_code] = dict(event_deadlines.get(family, {}))
+
+    item_names = event_items.get(event, []) if event else []
+    deadlines = event_deadlines.get(event, {}) if event else {}
+
+    completed_by_item = {}
+    if event:
+        # Items are stored against the prefixed event, e.g. "2026-27:BOR".
+        storage_event = f'{CURRENT_WRITTEN_STORAGE_PREFIX}{event}'
+        for item in ChecklistItem.query.filter(
+            ChecklistItem.user_id == current_user.id,
+            ChecklistItem.event.in_([storage_event, event]),
+        ).all():
+            if item.item_name:
+                completed_by_item[item.item_name] = bool(item.completed)
+
+    written_items = [
+        {
+            'name': name,
+            'completed': completed_by_item.get(name, False),
+            'deadline_text': deadlines.get(name),
+            'overdue': (
+                not completed_by_item.get(name, False)
+                and (_parse_written_deadline(deadlines.get(name)) or today) < today
+            ),
+        }
+        for name in item_names
+    ]
+    written_done = sum(1 for item in written_items if item['completed'])
+
     return render_template('member_commitments.html',
         all_commitments_map=all_commitments_map,
         conference_order=CONFERENCE_ORDER,
         active_conf=active_conf,
+        written_event=event,
+        written_items=written_items,
+        written_done=written_done,
+        written_total=len(written_items),
     )
 
 
