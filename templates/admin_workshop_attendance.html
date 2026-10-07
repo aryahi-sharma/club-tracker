@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{% block title %}Workshop Attendance{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+  <h2 class="mb-1">Workshop Attendance</h2>
+  <p class="text-muted mb-4">
+    Upload a CSV of weekly workshop form responses. A student passes if they
+    submitted the form <strong>and</strong> scored ≥ {{ score_threshold|int }}%.
+  </p>
+
+  {# Flash messages #}
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for cat, msg in messages %}
+      <div class="alert alert-{{ 'danger' if cat == 'danger' else 'warning' if cat == 'warning' else 'success' }} alert-dismissible fade show">
+        {{ msg }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+      </div>
+    {% endfor %}
+  {% endwith %}
+
+  {# Upload card #}
+  <div class="card shadow-sm mb-4">
+    <div class="card-header fw-semibold">Upload Weekly CSV</div>
+    <div class="card-body">
+      <form method="POST" enctype="multipart/form-data" action="{{ url_for('admin_workshop_attendance') }}">
+        <input type="hidden" name="action" value="upload">
+        <div class="row g-3 align-items-end">
+          <div class="col-md-3">
+            <label class="form-label fw-semibold">Week label</label>
+            <input type="date" name="week_label" class="form-control"
+                   value="{{ today_str if today_str else '' }}" required>
+            <div class="form-text">Used as the unique key for this week's data.</div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label fw-semibold">CSV file</label>
+            <input type="file" name="attendance_csv" accept=".csv" class="form-control" required>
+            <div class="form-text">
+              Required columns: <code>name</code> (or <code>email</code>),
+              <code>score</code>. Optional: <code>email</code>, <code>completed</code>.
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="form-check mt-4">
+              <input class="form-check-input" type="checkbox" name="overwrite" value="1" id="overwriteCheck">
+              <label class="form-check-label" for="overwriteCheck">
+                Overwrite existing entries for this week
+              </label>
+            </div>
+          </div>
+          <div class="col-md-2">
+            <button type="submit" class="btn btn-primary w-100">Upload</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  {# Weekly summary table #}
+  <div class="card shadow-sm mb-4">
+    <div class="card-header fw-semibold">All Weeks — Summary</div>
+    <div class="card-body p-0">
+      {% if week_summaries %}
+      <table class="table table-hover table-sm mb-0">
+        <thead class="table-light">
+          <tr>
+            <th>Week</th>
+            <th class="text-center">Total</th>
+            <th class="text-center text-success">Passed</th>
+            <th class="text-center text-danger">Failed</th>
+            <th class="text-center">Pass Rate</th>
+            <th></th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for ws in week_summaries %}
+          <tr class="{{ 'table-primary' if ws.week_label == selected_week else '' }}">
+            <td class="fw-semibold">{{ ws.week_label }}</td>
+            <td class="text-center">{{ ws.total }}</td>
+            <td class="text-center text-success fw-semibold">{{ ws.passed }}</td>
+            <td class="text-center text-danger fw-semibold">{{ ws.failed }}</td>
+            <td class="text-center">
+              <span class="badge {{ 'bg-success' if ws.pass_rate >= 80 else 'bg-warning text-dark' }}">
+                {{ ws.pass_rate }}%
+              </span>
+            </td>
+            <td>
+              <a href="{{ url_for('admin_workshop_attendance', week=ws.week_label) }}"
+                 class="btn btn-sm btn-outline-primary">View</a>
+            </td>
+            <td>
+              <form method="POST" action="{{ url_for('admin_workshop_attendance') }}"
+                    onsubmit="return confirm('Delete all data for week {{ ws.week_label }}?')">
+                <input type="hidden" name="action" value="delete_week">
+                <input type="hidden" name="week_label" value="{{ ws.week_label }}">
+                <button class="btn btn-sm btn-outline-danger">Delete</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <p class="text-muted p-3 mb-0">No weeks uploaded yet.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  {# Per-student detail for selected week #}
+  {% if selected_week %}
+  <div class="card shadow-sm">
+    <div class="card-header fw-semibold">
+      Detail — Week {{ selected_week }}
+      <span class="ms-2 badge bg-secondary">{{ selected_records|length }} students</span>
+    </div>
+    <div class="card-body p-0">
+      {% if selected_records %}
+      <table class="table table-hover table-sm mb-0">
+        <thead class="table-light">
+          <tr>
+            <th>Student</th>
+            <th>Email</th>
+            <th class="text-center">Completed</th>
+            <th class="text-center">Score</th>
+            <th class="text-center">Result</th>
+            <th>Uploaded</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in selected_records %}
+          <tr class="{{ '' if r.passed else 'table-warning' }}">
+            <td>{{ r.student_name }}</td>
+            <td class="text-muted small">{{ r.student_email or '—' }}</td>
+            <td class="text-center">
+              {% if r.completed %}
+                <span class="text-success">✓</span>
+              {% else %}
+                <span class="text-danger">✗</span>
+              {% endif %}
+            </td>
+            <td class="text-center">
+              {% if r.score is not none %}
+                <span class="{{ 'text-success fw-semibold' if r.score >= score_threshold else 'text-danger fw-semibold' }}">
+                  {{ "%.1f"|format(r.score) }}%
+                </span>
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td class="text-center">
+              {% if r.passed %}
+                <span class="badge bg-success">Pass</span>
+              {% else %}
+                <span class="badge bg-danger">Fail</span>
+              {% endif %}
+            </td>
+            <td class="text-muted small">{{ r.uploaded_at | pacific }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <p class="text-muted p-3 mb-0">No records for this week.</p>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
