@@ -184,7 +184,7 @@ OFFICER_ROSTER_2026_27 = [
     ("Philina Chen", "Officer, Admin"),
     ("Natalie Zhang", "Officer"),
     ("Melody Leong", "Officer"),
-    ("Aryahi Sharma", "Officer"),
+    ("Aryahi Sharma", "Officer, Admin"),
     ("Olivia Kang", "Officer"),
     ("Zihan Liu", "Officer"),
     ("Aaron Vu", "Admin, Officer"),
@@ -258,7 +258,7 @@ OFFICER_IMPORT_KEY = "2026-27-officer-roster-v3-advisors-and-additions"
 
 # This migration updates already-imported databases without rerunning the full
 # roster import (which would reset every officer's temporary password).
-REMOVED_ADMIN_ACCESS = ("Aryahi Sharma", "Olivia Kang", "Zihan Liu")
+REMOVED_ADMIN_ACCESS = ("Olivia Kang", "Zihan Liu")
 REMOVED_ADMIN_ACCESS_KEY = "2026-27-remove-admin-access-aryahi-olivia-zihan-v1"
 
 class User(UserMixin, db.Model):
@@ -459,6 +459,26 @@ class PracticeLog(db.Model):
     member = db.relationship('User', foreign_keys=[member_id], backref='practice_logs')
     session = db.relationship('PracticeSession', backref='log')
 
+class WorkshopAttendanceUpload(db.Model):
+    """Weekly workshop form responses uploaded by an admin."""
+    __tablename__ = 'workshop_attendance_upload'
+    id = db.Column(db.Integer, primary_key=True)
+    week_label = db.Column(db.String(50), nullable=False)
+    student_name = db.Column(db.String(200), nullable=False)
+    student_email = db.Column(db.String(200), nullable=True)
+    completed = db.Column(db.Boolean, nullable=False, default=False)
+    score = db.Column(db.Float, nullable=True)
+    passed = db.Column(db.Boolean, nullable=False, default=False)
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+    uploaded_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    uploader = db.relationship('User', foreign_keys=[uploaded_by])
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            'week_label', 'student_email',
+            name='uq_workshop_week_email'
+        ),
+    )
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -953,7 +973,24 @@ def create_new_officer_demo_pods():
             "[Demo Pods] officer accounts not found: "
             + ", ".join(missing_officers)
         )
-
+def grant_aryahi_admin():
+    """One-time: grant admin access to aryahi.sharma."""
+    key = "2026-27-grant-aryahi-admin-v1"
+    if db.session.get(DataMigration, key):
+        return
+    user = User.query.filter(
+        db.func.lower(User.username) == 'aryahi.sharma'
+    ).first()
+    if user:
+        user.is_admin = True
+        user.has_officer_access = True
+        user.role = 'officer'
+    db.session.add(DataMigration(
+        key=key,
+        details='Granted admin access to aryahi.sharma',
+    ))
+    db.session.commit()
+    print('[Admin Grant] aryahi.sharma is now admin.')
 
 def reconcile_saron_access():
     """Correct the old Saron username typo without changing the password."""
@@ -2138,6 +2175,16 @@ def _backfill_column(table, source, destination):
 with app.app_context():
     db.create_all()
 
+    # Migrate: workshop_attendance_upload table
+    _ensure_column('workshop_attendance_upload', 'week_label', 'VARCHAR(50)')
+    _ensure_column('workshop_attendance_upload', 'student_name', 'VARCHAR(200)')
+    _ensure_column('workshop_attendance_upload', 'student_email', 'VARCHAR(200)')
+    _ensure_column('workshop_attendance_upload', 'completed', 'BOOLEAN DEFAULT FALSE')
+    _ensure_column('workshop_attendance_upload', 'score', 'FLOAT')
+    _ensure_column('workshop_attendance_upload', 'passed', 'BOOLEAN DEFAULT FALSE')
+    _ensure_column('workshop_attendance_upload', 'uploaded_at', 'TIMESTAMP')
+    _ensure_column('workshop_attendance_upload', 'uploaded_by', 'INTEGER')
+
     engine_name = db.engine.dialect.name
     cols = {c['name'] for c in db.inspect(db.engine).get_columns('workshop')}
     if 'creator_id' not in cols:
@@ -2423,6 +2470,12 @@ with app.app_context():
     except Exception as exc:
         db.session.rollback()
         print(f'[Saron Access] reconciliation skipped: {exc}')
+
+    try:
+        grant_aryahi_admin()
+    except Exception as exc:
+        db.session.rollback()
+        print(f'[Admin Grant] aryahi skipped: {exc}')
 
 
 
@@ -4927,6 +4980,85 @@ def admin_member_commitments():
         checklist_items_by_conf=CHECKLIST_ITEMS,
     )
 
+# ── Workshop Attendance Upload helpers ───────────────────────────────────────
+
+WORKSHOP_SCORE_THRESHOLD = 80.0  # percent
+
+
+def _parse_workshop_attendance_csv(file_stream):
+    """Parse a CSV of workshop form responses.
+
+    Required columns: name (or email), score.
+    Optional: email, completed.
+    """
+    text = io.TextIOWrapper(file_stream, encoding='utf-8-sig', errors='replace')
+    reader = csv.DictReader(text)
+
+    raw_headers = reader.fieldnames or []
+    header_map = {}
+    for h in raw_headers:
+        key = h.strip().lower().replace(' ', '_')
+        header_map[key] = h
+        if key in {'student_name', 'full_name', 'mentee_name', 'member_name'}:
+            header_map['name'] = h
+        if key in {'total_score', 'grade', 'points', 'score_/100',
+                   'score_/10', 'quiz_score', 'form_score'}:
+            header_map['score'] = h
+        if key in {'submitted', 'done', 'completed_form', 'form_completed'}:
+            header_map['completed'] = h
+
+    name_col  = header_map.get('name')  or header_map.get('student_name')
+    email_col = header_map.get('email') or header_map.get('email_address')
+    score_col = header_map.get('score')
+    comp_col  = header_map.get('completed')
+
+    if not name_col and not email_col:
+        return [], ['CSV must have a "name" or "email" column.']
+    if not score_col:
+        return [], ['CSV must have a "score" column.']
+
+    rows = []
+    errors = []
+    for i, row in enumerate(reader, start=2):
+        name  = (row.get(name_col)  or '').strip()
+        email = (row.get(email_col) or '').strip().lower()
+        if not name and not email:
+            continue
+        raw_score = (row.get(score_col) or '').strip()
+        score = None
+        m = re.match(r'([\d.]+)\s*/\s*([\d.]+)', raw_score)
+        if m:
+            try:
+                score = float(m.group(1)) / float(m.group(2)) * 100
+            except (ValueError, ZeroDivisionError):
+                errors.append(f'Row {i}: could not parse score "{raw_score}"')
+                continue
+        else:
+            cleaned = raw_score.replace('%', '').strip()
+            try:
+                score = float(cleaned)
+            except ValueError:
+                errors.append(f'Row {i}: could not parse score "{raw_score}"')
+                continue
+        if score <= 10:
+            score *= 10
+
+        if comp_col:
+            raw_comp = (row.get(comp_col) or '').strip().lower()
+            completed = raw_comp in {'1', 'true', 'yes', 'y', 'x', 'done',
+                                     'submitted', 'complete', 'completed'}
+        else:
+            completed = True
+
+        passed = completed and score >= WORKSHOP_SCORE_THRESHOLD
+        rows.append({
+            'student_name': name or email,
+            'student_email': email or None,
+            'completed': completed,
+            'score': round(score, 2),
+            'passed': passed,
+        })
+    return rows, errors
 
 def _csv_response(filename, header, rows):
     """Build a downloadable CSV response."""
@@ -4940,7 +5072,131 @@ def _csv_response(filename, header, rows):
         headers={'Content-Disposition': f'attachment; filename="{filename}"'},
     )
 
+@app.route('/admin/workshop_attendance', methods=['GET', 'POST'])
+@login_required
+@admin_required
+def admin_workshop_attendance():
+    if request.method == 'POST':
+        action = request.form.get('action', 'upload')
 
+        if action == 'delete_week':
+            week_label = request.form.get('week_label', '').strip()
+            if week_label:
+                deleted = WorkshopAttendanceUpload.query.filter_by(
+                    week_label=week_label
+                ).delete()
+                db.session.commit()
+                flash(f'Deleted {deleted} row(s) for week {week_label}.', 'success')
+            return redirect(url_for('admin_workshop_attendance'))
+
+        file = request.files.get('attendance_csv')
+        week_label = request.form.get('week_label', '').strip()
+        overwrite = request.form.get('overwrite') == '1'
+
+        if not file or file.filename == '':
+            flash('Please select a CSV file.', 'danger')
+            return redirect(url_for('admin_workshop_attendance'))
+        if not week_label:
+            flash('Please enter a week label.', 'danger')
+            return redirect(url_for('admin_workshop_attendance'))
+        if not file.filename.lower().endswith('.csv'):
+            flash('Only CSV files are accepted.', 'danger')
+            return redirect(url_for('admin_workshop_attendance'))
+
+        rows, parse_errors = _parse_workshop_attendance_csv(file.stream)
+        if parse_errors:
+            for err in parse_errors:
+                flash(err, 'danger')
+            return redirect(url_for('admin_workshop_attendance'))
+        if not rows:
+            flash('The CSV had no valid data rows.', 'warning')
+            return redirect(url_for('admin_workshop_attendance'))
+
+        inserted = updated = skipped = 0
+        for row_data in rows:
+            existing = None
+            if row_data['student_email']:
+                existing = WorkshopAttendanceUpload.query.filter_by(
+                    week_label=week_label,
+                    student_email=row_data['student_email'],
+                ).first()
+            if existing:
+                if overwrite:
+                    existing.student_name = row_data['student_name']
+                    existing.completed    = row_data['completed']
+                    existing.score        = row_data['score']
+                    existing.passed       = row_data['passed']
+                    existing.uploaded_at  = datetime.utcnow()
+                    existing.uploaded_by  = current_user.id
+                    updated += 1
+                else:
+                    skipped += 1
+                continue
+            record = WorkshopAttendanceUpload(
+                week_label=week_label,
+                student_name=row_data['student_name'],
+                student_email=row_data['student_email'],
+                completed=row_data['completed'],
+                score=row_data['score'],
+                passed=row_data['passed'],
+                uploaded_by=current_user.id,
+            )
+            db.session.add(record)
+            inserted += 1
+
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            flash('Some rows conflicted. Try enabling overwrite and re-uploading.', 'danger')
+            return redirect(url_for('admin_workshop_attendance'))
+
+        msg = f'Week {week_label}: {inserted} inserted, {updated} updated'
+        if skipped:
+            msg += f', {skipped} skipped'
+        flash(msg + '.', 'success')
+        return redirect(url_for('admin_workshop_attendance'))
+
+    # GET
+    week_labels = [
+        row[0] for row in
+        db.session.query(WorkshopAttendanceUpload.week_label)
+        .distinct()
+        .order_by(WorkshopAttendanceUpload.week_label.desc())
+        .all()
+    ]
+    selected_week = request.args.get('week', week_labels[0] if week_labels else None)
+
+    week_summaries = []
+    for wl in week_labels:
+        records = WorkshopAttendanceUpload.query.filter_by(week_label=wl).all()
+        total  = len(records)
+        passed = sum(1 for r in records if r.passed)
+        week_summaries.append({
+            'week_label': wl,
+            'total': total,
+            'passed': passed,
+            'failed': total - passed,
+            'pass_rate': round(passed / total * 100, 1) if total else 0,
+        })
+
+    selected_records = []
+    if selected_week:
+        selected_records = WorkshopAttendanceUpload.query.filter_by(
+            week_label=selected_week
+        ).order_by(
+            WorkshopAttendanceUpload.passed.asc(),
+            WorkshopAttendanceUpload.student_name,
+        ).all()
+
+    return render_template(
+        'admin_workshop_attendance.html',
+        week_summaries=week_summaries,
+        selected_week=selected_week,
+        selected_records=selected_records,
+        score_threshold=WORKSHOP_SCORE_THRESHOLD,
+    )
+    
 @app.route('/at_risk_report.csv')
 @login_required
 def at_risk_report_csv():
